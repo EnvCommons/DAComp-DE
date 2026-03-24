@@ -1,0 +1,5 @@
+openreward
+pydantic
+openai
+duckdb
+pyyaml
