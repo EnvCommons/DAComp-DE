@@ -3,11 +3,14 @@
 Run with: uv run pytest tests.py -v
 """
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
+from openreward.api.sandboxes.types import FileTransferError, FileTransferResult
 
+import dacomp_de
 from evaluate_de import (
     extract_arch_score,
     extract_max_score_from_rubric,
@@ -110,3 +113,80 @@ class TestDEDataIntegrity:
     def test_stable_ordering(self, de_tasks):
         ids = [t["instance_id"] for t in de_tasks]
         assert ids == sorted(ids)
+
+
+class _FakeSandbox:
+    """Serves the agent's /workspace files. download() refuses files over the
+    SDK's default cap, as the real one does; download_to() streams with no cap."""
+
+    def __init__(self, files: dict[str, bytes]):
+        self.files = files
+
+    async def run(self, cmd):
+        return ("", 0)
+
+    async def download(self, path, max_size=256 * 1024 * 1024):
+        if len(self.files[path]) > max_size:
+            raise FileTransferError(f"{path} is over the {max_size}-byte download limit")
+        return self.files[path]
+
+    async def download_to(self, path, local_path):
+        if path not in self.files:
+            raise FileTransferError(f"Cannot download {path}: no such file")
+        data = self.files[path]
+        Path(local_path).write_bytes(data)
+        return FileTransferResult(size=len(data), sha256=hashlib.sha256(data).hexdigest())
+
+
+@pytest.fixture
+def pipeline_env(tmp_path, monkeypatch):
+    """A DE-Impl task whose pipeline writes /workspace/shop.duckdb; grading
+    records the bytes it was given and scores 80."""
+    (tmp_path / "gold" / "de-impl-1").mkdir(parents=True)
+    (tmp_path / "gold" / "de-impl-1" / "shop.duckdb").write_bytes(b"gold")
+    monkeypatch.setattr(dacomp_de, "_gold_db_dir", tmp_path / "gold")
+    monkeypatch.setattr(dacomp_de, "_eval_config", {"de-impl-1": {"database_file": "shop.duckdb"}})
+    graded = []
+
+    def fake_eval(pred_db_path, gold_db_path, config):
+        graded.append((pred_db_path, pred_db_path.read_bytes()))
+        return {"score": 80.0, "layers": []}
+
+    monkeypatch.setattr(dacomp_de, "evaluate_de_pipeline", fake_eval)
+    env = dacomp_de.DACompDE.__new__(dacomp_de.DACompDE)
+    env.instance_id = "de-impl-1"
+    return env, graded
+
+
+class TestPipelineSubmission:
+    @pytest.mark.asyncio
+    async def test_database_over_the_sdk_download_cap_is_graded(self, pipeline_env):
+        env, graded = pipeline_env
+        db = b"D" * (300 * 1024 * 1024)
+        env.sandbox = _FakeSandbox({"/workspace/shop.duckdb": db})
+
+        result = await env._eval_pipeline()
+
+        assert result.reward == pytest.approx(0.8)
+        assert len(graded) == 1 and graded[0][1] == db
+        assert not graded[0][0].exists()  # the temp copy is cleaned up
+
+    @pytest.mark.asyncio
+    async def test_missing_database(self, pipeline_env):
+        env, graded = pipeline_env
+        env.sandbox = _FakeSandbox({})
+
+        result = await env._eval_pipeline()
+
+        assert result.metadata["error"] == "no_database" and result.reward == 0.0
+        assert graded == []
+
+    @pytest.mark.asyncio
+    async def test_empty_database(self, pipeline_env):
+        env, graded = pipeline_env
+        env.sandbox = _FakeSandbox({"/workspace/shop.duckdb": b""})
+
+        result = await env._eval_pipeline()
+
+        assert result.metadata["error"] == "empty_database" and result.reward == 0.0
+        assert graded == []

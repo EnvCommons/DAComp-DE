@@ -385,28 +385,6 @@ You get one submission attempt."""
         if run_code != 0:
             logger.warning(f"run.py failed for {self.instance_id}: exit {run_code}")
 
-        # Download the resulting DuckDB from sandbox
-        try:
-            pred_db_bytes = await self.sandbox.download(f"/workspace/{database_file}")
-        except Exception as e:
-            return ToolOutput(
-                blocks=[TextBlock(
-                    text=f"Pipeline execution failed: could not find {database_file}.\n"
-                    f"run.py output:\n{run_output}\n(exit {run_code})"
-                )],
-                metadata={"error": "no_database", "run_output": run_output, "run_code": run_code},
-                reward=0.0,
-                finished=True,
-            )
-
-        if not pred_db_bytes:
-            return ToolOutput(
-                blocks=[TextBlock(text=f"Pipeline produced empty database file: {database_file}")],
-                metadata={"error": "empty_database"},
-                reward=0.0,
-                finished=True,
-            )
-
         # Find gold DuckDB (stored per-task: gold/{instance_id}/{database_file})
         gold_db_path = _gold_db_dir / self.instance_id / database_file
         if not gold_db_path.exists():
@@ -420,28 +398,45 @@ You get one submission attempt."""
                 finished=True,
             )
 
-        # Write pred DB to temp file for comparison
-        import tempfile
-        with tempfile.NamedTemporaryFile(suffix=".duckdb", delete=False) as tmp:
-            tmp.write(pred_db_bytes)
-            pred_db_path = Path(tmp.name)
+        # Stream the resulting DuckDB from the sandbox to a temp file. Databases
+        # for some tasks are several hundred MB, so it is not read into memory.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pred_db_path = Path(tmp_dir) / "pred.duckdb"
+            try:
+                transfer = await self.sandbox.download_to(f"/workspace/{database_file}", pred_db_path)
+            except Exception as e:
+                return ToolOutput(
+                    blocks=[TextBlock(
+                        text=f"Pipeline execution failed: could not find {database_file}.\n"
+                        f"run.py output:\n{run_output}\n(exit {run_code})"
+                    )],
+                    metadata={"error": "no_database", "run_output": run_output, "run_code": run_code},
+                    reward=0.0,
+                    finished=True,
+                )
 
-        try:
-            eval_result = evaluate_de_pipeline(
-                pred_db_path=pred_db_path,
-                gold_db_path=gold_db_path,
-                config=config,
-            )
-        except Exception as e:
-            logger.exception("DE pipeline evaluation error")
-            return ToolOutput(
-                blocks=[TextBlock(text=f"Evaluation error: {e}")],
-                metadata={"error": str(e)},
-                reward=0.0,
-                finished=True,
-            )
-        finally:
-            pred_db_path.unlink(missing_ok=True)
+            if transfer.size == 0:
+                return ToolOutput(
+                    blocks=[TextBlock(text=f"Pipeline produced empty database file: {database_file}")],
+                    metadata={"error": "empty_database"},
+                    reward=0.0,
+                    finished=True,
+                )
+
+            try:
+                eval_result = evaluate_de_pipeline(
+                    pred_db_path=pred_db_path,
+                    gold_db_path=gold_db_path,
+                    config=config,
+                )
+            except Exception as e:
+                logger.exception("DE pipeline evaluation error")
+                return ToolOutput(
+                    blocks=[TextBlock(text=f"Evaluation error: {e}")],
+                    metadata={"error": str(e)},
+                    reward=0.0,
+                    finished=True,
+                )
 
         score = eval_result["score"]
         reward = score / 100.0
